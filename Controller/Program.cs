@@ -9,8 +9,16 @@ Application.Run(new ControllerForm(serverUrl));
 
 sealed class ScreenBox : PictureBox
 {
-    public ScreenBox() { SetStyle(ControlStyles.Selectable, true); TabStop = true; SizeMode = PictureBoxSizeMode.Zoom; BackColor = Color.Black; Dock = DockStyle.Fill; }
-    protected override bool IsInputKey(Keys k) => true;     // Tab, setas, etc. vão para o remoto
+    public ScreenBox()
+    {
+        SetStyle(ControlStyles.Selectable, true);
+        TabStop = true;
+        SizeMode = PictureBoxSizeMode.Zoom;
+        BackColor = Color.Black;
+        Dock = DockStyle.Fill;
+    }
+
+    protected override bool IsInputKey(Keys k) => true; // Tab, setas, etc. vão para o remoto
 }
 
 sealed class ControllerForm : Form
@@ -23,40 +31,76 @@ sealed class ControllerForm : Form
     readonly Label _status = new() { AutoSize = true, Text = "Desligado", Padding = new Padding(8, 6, 0, 0) };
     readonly ScreenBox _pic = new();
     CancellationTokenSource? _cts;
-    SafeWs? _conn; Secure? _sec;
+    SafeWs? _conn;
+    Secure? _sec;
     volatile bool _accepted;
     long _lastMove;
 
     public static string ResolveServerUrl(string[] args)
     {
-        if (args.Length > 0 && !string.IsNullOrWhiteSpace(args[0]))
-            return args[0].Trim();
+        string? raw = null;
 
-        var cfgPath = Path.Combine(AppContext.BaseDirectory, "server.txt");
-        if (File.Exists(cfgPath))
+        if (args.Length > 0 && !string.IsNullOrWhiteSpace(args[0]))
         {
-            var content = File.ReadAllText(cfgPath).Trim();
-            if (!string.IsNullOrWhiteSpace(content))
-                return content;
+            raw = args[0];
+        }
+        else
+        {
+            var cfgPath = Path.Combine(AppContext.BaseDirectory, "server.txt");
+            if (File.Exists(cfgPath))
+            {
+                raw = File.ReadAllText(cfgPath);
+            }
         }
 
-        return "ws://127.0.0.1:5000/ws";
+        var cleaned = (raw ?? "").Trim().Trim('\uFEFF');
+        if (string.IsNullOrWhiteSpace(cleaned))
+            return "ws://127.0.0.1:5000/ws";
+
+        if (cleaned.StartsWith("https://", StringComparison.OrdinalIgnoreCase))
+            cleaned = "wss://" + cleaned["https://".Length..];
+        else if (cleaned.StartsWith("http://", StringComparison.OrdinalIgnoreCase))
+            cleaned = "ws://" + cleaned["http://".Length..];
+
+        cleaned = cleaned.TrimEnd('/');
+        if (!cleaned.EndsWith("/ws", StringComparison.OrdinalIgnoreCase))
+            cleaned += "/ws";
+
+        return cleaned;
+    }
+
+    static void LogError(string context, string url, Exception ex)
+    {
+        try
+        {
+            var logPath = Path.Combine(AppContext.BaseDirectory, "controller_debug.log");
+            var entry = $"[{DateTime.Now:yyyy-MM-dd HH:mm:ss}] ({context}) URL={url}\n{ex}\n----------------------------------------\n";
+            File.AppendAllText(logPath, entry);
+        }
+        catch
+        {
+            // Ignora falhas de escrita em disco
+        }
     }
 
     public ControllerForm(string serverUrl)
     {
         _serverUrl = serverUrl;
-        Text = "Controlador"; Width = 1100; Height = 700;
+        Text = "Controlador";
+        Width = 1100;
+        Height = 700;
+
         var top = new FlowLayoutPanel { Dock = DockStyle.Top, AutoSize = true };
         top.Controls.AddRange(new Control[] { _id, _pwd, _btn, _status });
-        Controls.Add(_pic); Controls.Add(top);              // Fill primeiro, Top depois
+        Controls.Add(_pic);
+        Controls.Add(top); // Fill primeiro, Top depois
 
         _btn.Click += (_, _) => { if (_cts is null) Connect(); else _cts.Cancel(); };
         _pic.MouseDown += (_, e) => { _pic.Focus(); if (Map(e, out var x, out var y)) Send(new { k = "md", x, y, b = Btn(e) }); };
         _pic.MouseUp += (_, e) => { if (Map(e, out var x, out var y)) Send(new { k = "mu", x, y, b = Btn(e) }); };
         _pic.MouseMove += (_, e) =>
         {
-            if (Environment.TickCount64 - _lastMove < 12) return;          // limita a ~80 eventos/s
+            if (Environment.TickCount64 - _lastMove < 12) return; // limita a ~80 eventos/s
             _lastMove = Environment.TickCount64;
             if (Map(e, out var x, out var y)) Send(new { k = "mm", x, y });
         };
@@ -71,61 +115,105 @@ sealed class ControllerForm : Form
     // Converte posição no PictureBox (Zoom) em coordenadas normalizadas 0..1 do ecrã remoto
     bool Map(MouseEventArgs e, out double nx, out double ny)
     {
-        nx = ny = 0; var img = _pic.Image; if (img is null) return false;
+        nx = ny = 0;
+        var img = _pic.Image;
+        if (img is null) return false;
+
         double s = Math.Min((double)_pic.Width / img.Width, (double)_pic.Height / img.Height);
-        double w = img.Width * s, h = img.Height * s, ox = (_pic.Width - w) / 2, oy = (_pic.Height - h) / 2;
-        nx = (e.X - ox) / w; ny = (e.Y - oy) / h;
+        double w = img.Width * s;
+        double h = img.Height * s;
+        double ox = (_pic.Width - w) / 2;
+        double oy = (_pic.Height - h) / 2;
+
+        nx = (e.X - ox) / w;
+        ny = (e.Y - oy) / h;
         return nx is >= 0 and <= 1 && ny is >= 0 and <= 1;
     }
 
     void Send(object o)
     {
-        var c = _conn; var s = _sec;
+        var c = _conn;
+        var s = _sec;
         if (c is null || s is null || !_accepted) return;
         _ = c.SendAsync(s.Seal(Proto.Input, JsonSerializer.SerializeToUtf8Bytes(o)), WebSocketMessageType.Binary, CancellationToken.None);
     }
 
-    void SetStatus(string t) { if (IsHandleCreated && !IsDisposed) BeginInvoke(() => _status.Text = t); }
+    void SetStatus(string t)
+    {
+        if (IsHandleCreated && !IsDisposed)
+            BeginInvoke(() => _status.Text = t);
+    }
 
     void Connect()
     {
-        var id = _id.Text.Replace(" ", ""); var pwd = _pwd.Text.Trim().ToUpperInvariant();
-        if (id.Length < 6 || pwd.Length < 4) { SetStatus("Indique ID e senha"); return; }
-        _cts = new CancellationTokenSource(); _btn.Text = "Desligar";
+        var id = _id.Text.Replace(" ", "").Trim();
+        var pwd = _pwd.Text.Trim().ToUpperInvariant();
+        if (id.Length < 6 || pwd.Length < 4)
+        {
+            SetStatus("Indique ID e senha");
+            return;
+        }
+
+        _cts = new CancellationTokenSource();
+        _btn.Text = "Desligar";
         var ct = _cts.Token;
+
         _ = Task.Run(async () =>
         {
             await RunAsync(id, pwd, ct);
-            BeginInvoke(() => { _btn.Text = "Ligar"; _cts = null; _status.Text = "Desligado"; });
+            if (IsHandleCreated && !IsDisposed)
+            {
+                BeginInvoke(() =>
+                {
+                    _btn.Text = "Ligar";
+                    _cts?.Dispose();
+                    _cts = null;
+                    _status.Text = "Desligado";
+                });
+            }
         });
+
         _pic.Focus();
     }
 
     async Task RunAsync(string id, string pwd, CancellationToken ct)
     {
         var sec = _sec = new Secure(Proto.DeriveKey(id, pwd));
+
         while (!ct.IsCancellationRequested)
         {
+            ClientWebSocket? ws = null;
             try
             {
-                using var ws = new ClientWebSocket();
+                ws = new ClientWebSocket();
                 ws.Options.KeepAliveInterval = TimeSpan.FromSeconds(20);
                 SetStatus("A ligar...");
+
                 await ws.ConnectAsync(new Uri(_serverUrl), ct);
+
                 var conn = _conn = new SafeWs(ws);
                 await conn.SendAsync(JsonSerializer.SerializeToUtf8Bytes(
                     new { role = "controller", id, hash = Proto.AuthHash(id, pwd) }), WebSocketMessageType.Text, ct);
 
                 var (_, d0) = await WsUtil.ReceiveAsync(ws, ct);
-                var reply = d0 is null ? "" : Encoding.UTF8.GetString(d0);
-                if (reply is "ERR:auth" or "ERR:locked")
-                { SetStatus(reply == "ERR:auth" ? "ID/senha incorretos" : "Bloqueado 60 s (demasiadas tentativas)"); return; }
+                var reply = d0 is null ? "" : Encoding.UTF8.GetString(d0).Trim();
 
-                if (reply != "OK") SetStatus("Cliente offline — a tentar de novo...");
+                if (reply is "ERR:auth" or "ERR:locked")
+                {
+                    SetStatus(reply == "ERR:auth" ? "ID/senha incorretos" : "Bloqueado 60 s (demasiadas tentativas)");
+                    return;
+                }
+
+                if (reply != "OK")
+                {
+                    SetStatus(reply == "ERR:offline"
+                        ? "Cliente offline — a tentar de novo..."
+                        : $"Resposta inesperada ({reply}) — a tentar de novo...");
+                }
                 else
                 {
                     SetStatus("Ligado — a aguardar autorização do cliente...");
-                    while (true)
+                    while (!ct.IsCancellationRequested && ws.State == WebSocketState.Open)
                     {
                         var (t, d) = await WsUtil.ReceiveAsync(ws, ct);
                         if (d is null) break;
@@ -135,24 +223,74 @@ sealed class ControllerForm : Form
                     }
                 }
             }
-            catch (OperationCanceledException) { return; }
-            catch (Exception ex) { SetStatus("Erro: " + ex.Message); }
-            _accepted = false;
+            catch (OperationCanceledException)
+            {
+                return;
+            }
+            catch (Exception ex)
+            {
+                LogError("RunAsync", _serverUrl, ex);
+                SetStatus("Erro: " + ex.Message);
+            }
+            finally
+            {
+                _accepted = false;
+                _conn = null;
+                try { ws?.Dispose(); } catch { }
+            }
+
             try { await Task.Delay(3000, ct); } catch { return; }
         }
     }
 
     void OnControl(byte[] data)
     {
-        var c = JsonDocument.Parse(data).RootElement.GetProperty("c").GetString();
-        if (c == "accepted") { _accepted = true; SetStatus("Sessão ativa"); }
-        else if (c == "denied") { _accepted = false; SetStatus("O cliente recusou a ligação"); }
+        try
+        {
+            using var doc = JsonDocument.Parse(data);
+            var c = doc.RootElement.GetProperty("c").GetString();
+            if (c == "accepted")
+            {
+                _accepted = true;
+                SetStatus("Sessão ativa");
+            }
+            else if (c == "denied")
+            {
+                _accepted = false;
+                SetStatus("O cliente recusou a ligação");
+            }
+        }
+        catch (Exception ex)
+        {
+            LogError("OnControl", _serverUrl, ex);
+        }
     }
 
     void ShowFrame(byte[] jpeg)
     {
         Image img;
-        try { img = Image.FromStream(new MemoryStream(jpeg)); } catch { return; }
-        BeginInvoke(() => { var old = _pic.Image; _pic.Image = img; old?.Dispose(); });
+        try
+        {
+            using var ms = new MemoryStream(jpeg);
+            img = Image.FromStream(ms);
+        }
+        catch
+        {
+            return;
+        }
+
+        if (IsHandleCreated && !IsDisposed)
+        {
+            BeginInvoke(() =>
+            {
+                var old = _pic.Image;
+                _pic.Image = img;
+                old?.Dispose();
+            });
+        }
+        else
+        {
+            img.Dispose();
+        }
     }
 }

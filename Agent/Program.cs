@@ -27,79 +27,154 @@ sealed class AgentForm : Form
 
     public static string ResolveServerUrl(string[] args)
     {
-        if (args.Length > 0 && !string.IsNullOrWhiteSpace(args[0]))
-            return args[0].Trim();
+        string? raw = null;
 
-        var cfgPath = Path.Combine(AppContext.BaseDirectory, "server.txt");
-        if (File.Exists(cfgPath))
+        if (args.Length > 0 && !string.IsNullOrWhiteSpace(args[0]))
         {
-            var content = File.ReadAllText(cfgPath).Trim();
-            if (!string.IsNullOrWhiteSpace(content))
-                return content;
+            raw = args[0];
+        }
+        else
+        {
+            var cfgPath = Path.Combine(AppContext.BaseDirectory, "server.txt");
+            if (File.Exists(cfgPath))
+            {
+                raw = File.ReadAllText(cfgPath);
+            }
         }
 
-        return "ws://127.0.0.1:5000/ws";
+        var cleaned = (raw ?? "").Trim().Trim('\uFEFF');
+        if (string.IsNullOrWhiteSpace(cleaned))
+            return "ws://127.0.0.1:5000/ws";
+
+        if (cleaned.StartsWith("https://", StringComparison.OrdinalIgnoreCase))
+            cleaned = "wss://" + cleaned["https://".Length..];
+        else if (cleaned.StartsWith("http://", StringComparison.OrdinalIgnoreCase))
+            cleaned = "ws://" + cleaned["http://".Length..];
+
+        cleaned = cleaned.TrimEnd('/');
+        if (!cleaned.EndsWith("/ws", StringComparison.OrdinalIgnoreCase))
+            cleaned += "/ws";
+
+        return cleaned;
+    }
+
+    static void LogError(string context, string url, Exception ex)
+    {
+        try
+        {
+            var logPath = Path.Combine(AppContext.BaseDirectory, "agent_debug.log");
+            var entry = $"[{DateTime.Now:yyyy-MM-dd HH:mm:ss}] ({context}) URL={url}\n{ex}\n----------------------------------------\n";
+            File.AppendAllText(logPath, entry);
+        }
+        catch
+        {
+            // Ignora falhas de escrita em disco
+        }
     }
 
     public AgentForm(string serverUrl)
     {
         _serverUrl = serverUrl;
         _sec = new Secure(Proto.DeriveKey(_id, _pwd));
-        Text = "Suporte Remoto"; Width = 420; Height = 330; StartPosition = FormStartPosition.CenterScreen;
-        var flow = new FlowLayoutPanel { Dock = DockStyle.Fill, FlowDirection = FlowDirection.TopDown, Padding = new Padding(16) };
+        Text = "Suporte Remoto";
+        Width = 440;
+        Height = 350;
+        StartPosition = FormStartPosition.CenterScreen;
+
+        var flow = new FlowLayoutPanel
+        {
+            Dock = DockStyle.Fill,
+            FlowDirection = FlowDirection.TopDown,
+            Padding = new Padding(16)
+        };
         var big = new Font("Segoe UI", 20, FontStyle.Bold);
+        var smallInfo = new Font("Segoe UI", 8.5f);
+
         flow.Controls.Add(new Label { Text = "O seu ID:", AutoSize = true });
         flow.Controls.Add(new Label { Text = $"{_id[..3]} {_id[3..6]} {_id[6..]}", Font = big, AutoSize = true });
         flow.Controls.Add(new Label { Text = "Senha temporária:", AutoSize = true });
         flow.Controls.Add(new Label { Text = _pwd, Font = big, AutoSize = true });
         flow.Controls.Add(_status);
+        flow.Controls.Add(new Label { Text = $"Servidor: {_serverUrl}", Font = smallInfo, ForeColor = Color.DimGray, AutoSize = true, Padding = new Padding(0, 4, 0, 6) });
+
         var stop = new Button { Text = "Terminar sessão", AutoSize = true };
         stop.Click += (_, _) => Close();
         flow.Controls.Add(stop);
         Controls.Add(flow);
+
         Load += (_, _) => _ = Task.Run(() => RunAsync(_cts.Token));
         FormClosing += (_, _) => { _cts.Cancel(); _capCts?.Cancel(); };
     }
 
-    void SetStatus(string s) { if (IsHandleCreated && !IsDisposed) BeginInvoke(() => _status.Text = s); }
+    void SetStatus(string s)
+    {
+        if (IsHandleCreated && !IsDisposed)
+            BeginInvoke(() => _status.Text = s);
+    }
 
     async Task RunAsync(CancellationToken ct)
     {
         while (!ct.IsCancellationRequested)
         {
+            ClientWebSocket? ws = null;
             try
             {
-                using var ws = new ClientWebSocket();
+                ws = new ClientWebSocket();
                 ws.Options.KeepAliveInterval = TimeSpan.FromSeconds(20);
                 SetStatus("A ligar ao servidor...");
-                await ws.ConnectAsync(new Uri(_serverUrl), ct);
+
+                var uri = new Uri(_serverUrl);
+                await ws.ConnectAsync(uri, ct);
+
                 var conn = new SafeWs(ws);
                 await conn.SendAsync(JsonSerializer.SerializeToUtf8Bytes(
                     new { role = "target", id = _id, hash = Proto.AuthHash(_id, _pwd) }),
                     WebSocketMessageType.Text, ct);
 
-                while (true)
+                while (!ct.IsCancellationRequested && ws.State == WebSocketState.Open)
                 {
                     var (type, data) = await WsUtil.ReceiveAsync(ws, ct);
                     if (data is null) break;
-                    if (type == WebSocketMessageType.Text) OnText(conn, Encoding.UTF8.GetString(data), ct);
+                    if (type == WebSocketMessageType.Text) OnText(conn, Encoding.UTF8.GetString(data));
                     else if (_allowed && _sec.Open(data) is { } m && m.type == Proto.Input) Inject(m.data);
                 }
             }
-            catch (OperationCanceledException) { }
-            catch (Exception ex) { SetStatus("Ligação perdida: " + ex.Message); }
-            finally { StopCapture(); }
-            try { await Task.Delay(3000, ct); } catch { }
+            catch (OperationCanceledException)
+            {
+                break;
+            }
+            catch (Exception ex)
+            {
+                LogError("RunAsync", _serverUrl, ex);
+                SetStatus("Ligação perdida: " + ex.Message);
+            }
+            finally
+            {
+                StopCapture();
+                try { ws?.Dispose(); } catch { }
+            }
+
+            try { await Task.Delay(3000, ct); } catch { break; }
         }
     }
 
-    void OnText(SafeWs conn, string msg, CancellationToken ct)
+    void OnText(SafeWs conn, string msg)
     {
         switch (msg)
         {
-            case "OK": SetStatus("Pronto — a aguardar o técnico"); break;
-            case "PEER_JOINED": _ = Task.Run(() => AskConsentAsync(conn)); break;
-            case "PEER_LEFT": StopCapture(); SetStatus("O técnico desligou-se"); break;
+            case "OK":
+                SetStatus("Pronto — a aguardar o técnico");
+                break;
+            case "PEER_JOINED":
+                _ = Task.Run(() => AskConsentAsync(conn));
+                break;
+            case "PEER_LEFT":
+                StopCapture();
+                SetStatus("O técnico desligou-se");
+                break;
+            case "ERR:id_in_use":
+                SetStatus("Erro: ID já em uso no servidor");
+                break;
         }
     }
 
@@ -124,7 +199,10 @@ sealed class AgentForm : Form
             _ = Task.Run(() => CaptureLoopAsync(conn, token));
             SetStatus("SESSÃO ATIVA — técnico ligado");
         }
-        else await Send(conn, "{\"c\":\"denied\"}");
+        else
+        {
+            await Send(conn, "{\"c\":\"denied\"}");
+        }
     }
 
     Task Send(SafeWs c, string json) =>
@@ -135,7 +213,10 @@ sealed class AgentForm : Form
     // ---------- Captura com qualidade/FPS adaptativos ----------
     async Task CaptureLoopAsync(SafeWs conn, CancellationToken ct)
     {
-        int quality = 60, fps = 15; double scale = 1.0; byte[]? last = null;
+        int quality = 60, fps = 15;
+        double scale = 1.0;
+        byte[]? last = null;
+
         while (!ct.IsCancellationRequested)
         {
             var t0 = Stopwatch.GetTimestamp();
@@ -148,15 +229,18 @@ sealed class AgentForm : Form
                     last = h;
                     var s0 = Stopwatch.GetTimestamp();
                     await conn.SendAsync(_sec.Seal(Proto.Frame, jpeg), WebSocketMessageType.Binary, ct);
-                    double sendMs = Stopwatch.GetElapsedTime(s0).TotalMilliseconds, budget = 1000.0 / fps;
+                    double sendMs = Stopwatch.GetElapsedTime(s0).TotalMilliseconds;
+                    double budget = 1000.0 / fps;
                     if (sendMs > budget * 1.5)
                     {
-                        quality = Math.Max(25, quality - 8); fps = Math.Max(4, fps - 2);
+                        quality = Math.Max(25, quality - 8);
+                        fps = Math.Max(4, fps - 2);
                         if (quality <= 33) scale = Math.Max(0.5, scale - 0.1);
                     }
                     else if (sendMs < budget * 0.4)
                     {
-                        quality = Math.Min(80, quality + 3); fps = Math.Min(24, fps + 1);
+                        quality = Math.Min(80, quality + 3);
+                        fps = Math.Min(24, fps + 1);
                         scale = Math.Min(1.0, scale + 0.05);
                     }
                 }
@@ -175,7 +259,8 @@ sealed class AgentForm : Form
         using var full = new Bitmap(b.Width, b.Height, PixelFormat.Format24bppRgb);
         using (var g = Graphics.FromImage(full)) g.CopyFromScreen(b.Location, Point.Empty, b.Size);
 
-        Bitmap src = full; Bitmap? small = null;
+        Bitmap src = full;
+        Bitmap? small = null;
         if (scale < 0.99)
         {
             small = new Bitmap((int)(b.Width * scale), (int)(b.Height * scale), PixelFormat.Format24bppRgb);
